@@ -53,6 +53,7 @@ CATEGORIES_EXPENSE = [
     "Verzekeringen (insurance)",
     "Professionele diensten (legal/accounting)",
     "Marketing & reclame",
+    "Representatiekosten (business meals/entertainment)",
     "Afschrijvingen (depreciation)",
     "Autokosten (vehicle)",
     "Oprichtingskosten (company setup)",
@@ -60,6 +61,13 @@ CATEGORIES_EXPENSE = [
 ]
 
 BTW_RATES = {"21%": 0.21, "9%": 0.09, "0% (vrijgesteld)": 0.0, "Geen BTW": 0.0}
+
+# Categories where only a percentage of the cost is deductible for income tax.
+# BTW is still 100% reclaimable on these, but the cost itself is only partially deductible.
+# Dutch law: food/drink/entertainment (representatiekosten) = 80% deductible.
+PARTIAL_DEDUCTIBLE = {
+    "Representatiekosten (business meals/entertainment)": 0.80,
+}
 
 # Default BTW rate per expense category — so you don't have to think about it.
 # Travel (OV) is 9% in NL. Insurance is exempt. Everything else is 21%.
@@ -71,6 +79,7 @@ CATEGORY_BTW_DEFAULTS = {
     "Verzekeringen (insurance)": "0% (vrijgesteld)",
     "Professionele diensten (legal/accounting)": "21%",
     "Marketing & reclame": "21%",
+    "Representatiekosten (business meals/entertainment)": "9%",
     "Afschrijvingen (depreciation)": "Geen BTW",
     "Autokosten (vehicle)": "21%",
     "Oprichtingskosten (company setup)": "21%",
@@ -926,6 +935,27 @@ def render_btw_quarter(selected_quarter):
             )
         ]
 
+    # Partial deductibility warning (80% rule on business meals)
+    partial_warnings = []
+    for cat, pct in PARTIAL_DEDUCTIBLE.items():
+        cat_rows = expense[expense["category"] == cat]
+        if len(cat_rows) > 0:
+            total_excl = cat_rows["amount_excl"].sum()
+            non_deductible = total_excl * (1 - pct)
+            partial_warnings.append(
+                dbc.Alert(
+                    [
+                        html.Strong(f"Let op — {cat}: "),
+                        f"€ {total_excl:,.2f} excl. BTW dit kwartaal. "
+                        f"Hiervan is slechts {int(pct * 100)}% aftrekbaar voor de inkomstenbelasting "
+                        f"(€ {total_excl * pct:,.2f}). Het niet-aftrekbare deel is € {non_deductible:,.2f}. "
+                        f"De BTW (€ {cat_rows['btw_amount'].sum():,.2f}) is wél 100% aftrekbaar als voorbelasting. "
+                        "Dit is alleen relevant voor je IB-aangifte, niet voor de BTW-aangifte hierboven.",
+                    ],
+                    color="warning",
+                )
+            )
+
     # Filing guidance
     guidance = dbc.Alert(
         [
@@ -941,7 +971,7 @@ def render_btw_quarter(selected_quarter):
     )
 
     return html.Div(
-        [form_table] + expense_detail + [guidance]
+        [form_table] + expense_detail + partial_warnings + [guidance]
     )
 
 
