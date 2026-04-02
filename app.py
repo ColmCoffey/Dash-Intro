@@ -586,112 +586,285 @@ def btw_page(data):
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["quarter"] = df["date"].dt.to_period("Q").astype(str)
     df["btw_rate_val"] = df["btw_rate"].map(BTW_RATES).fillna(0)
-    df["amount_excl"] = df["amount"] / (1 + df["btw_rate_val"])
-    df["btw_amount"] = df["amount"] - df["amount_excl"]
-
-    # Handle 0% rate division
-    mask_zero = df["btw_rate_val"] == 0
-    df.loc[mask_zero, "amount_excl"] = df.loc[mask_zero, "amount"]
-    df.loc[mask_zero, "btw_amount"] = 0
+    # Amounts excl. BTW and BTW component
+    df["amount_excl"] = df.apply(
+        lambda r: r["amount"] / (1 + r["btw_rate_val"]) if r["btw_rate_val"] > 0 else r["amount"],
+        axis=1,
+    ).round(2)
+    df["btw_amount"] = (df["amount"] - df["amount_excl"]).round(2)
 
     quarters = sorted(df["quarter"].unique(), reverse=True)
-    cards = []
 
-    for q in quarters:
-        dq = df[df["quarter"] == q]
-        income_excl = dq.loc[dq["type"] == "income", "amount_excl"].sum()
-        expense_excl = dq.loc[dq["type"] == "expense", "amount_excl"].sum()
-        btw_collected = dq.loc[dq["type"] == "income", "btw_amount"].sum()
-        btw_deducted = dq.loc[dq["type"] == "expense", "btw_amount"].sum()
-        btw_due = btw_collected - btw_deducted
-
-        # Breakdown by rate for income
-        rate_rows = []
-        for rate_label, rate_val in BTW_RATES.items():
-            mask = (dq["type"] == "income") & (dq["btw_rate"] == rate_label)
-            if mask.any():
-                rate_rows.append(
-                    html.Tr(
-                        [
-                            html.Td(rate_label),
-                            html.Td(f"€ {dq.loc[mask, 'amount_excl'].sum():,.2f}"),
-                            html.Td(f"€ {dq.loc[mask, 'btw_amount'].sum():,.2f}"),
-                        ]
-                    )
-                )
-
-        card = dbc.Card(
-            dbc.CardBody(
-                [
-                    html.H5(f"Kwartaal {q}"),
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                [
-                                    html.P(f"Omzet excl. BTW: € {income_excl:,.2f}"),
-                                    html.P(f"Kosten excl. BTW: € {expense_excl:,.2f}"),
-                                ],
-                                width=4,
-                            ),
-                            dbc.Col(
-                                [
-                                    html.P(f"BTW ontvangen: € {btw_collected:,.2f}"),
-                                    html.P(f"BTW betaald (voorbelasting): € {btw_deducted:,.2f}"),
-                                ],
-                                width=4,
-                            ),
-                            dbc.Col(
-                                [
-                                    html.H5(
-                                        f"Te betalen: € {btw_due:,.2f}",
-                                        className="text-danger" if btw_due > 0 else "text-success",
-                                    ),
-                                    html.Small(
-                                        "Terug te ontvangen" if btw_due < 0 else "Af te dragen"
-                                    ),
-                                ],
-                                width=4,
-                            ),
-                        ]
-                    ),
-                    html.Details(
-                        [
-                            html.Summary("BTW specificatie omzet"),
-                            dbc.Table(
-                                [
-                                    html.Thead(
-                                        html.Tr(
-                                            [
-                                                html.Th("Tarief"),
-                                                html.Th("Omzet excl."),
-                                                html.Th("BTW"),
-                                            ]
-                                        )
-                                    ),
-                                    html.Tbody(rate_rows),
-                                ],
-                                bordered=True,
-                                size="sm",
-                                className="mt-2",
-                            ),
-                        ]
-                    ),
-                ]
-            ),
-            className="mb-3",
-        )
-        cards.append(card)
+    # Quarter selector
+    quarter_options = [{"label": q, "value": q} for q in quarters]
 
     return html.Div(
         [
             html.H3("BTW Aangifte (per kwartaal)"),
             html.P(
-                "Gebruik deze overzichten bij het invullen van je BTW aangifte op MijnBelastingdienst.",
+                "Overzicht volgens de rubrieken van de BTW-aangifte bij MijnBelastingdienst. "
+                "Gebruik deze nummers bij het invullen van je aangifte.",
                 className="text-muted",
             ),
             html.Hr(),
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            dbc.Label("Selecteer kwartaal"),
+                            dbc.Select(
+                                id="btw-quarter-select",
+                                options=quarter_options,
+                                value=quarters[0] if quarters else None,
+                            ),
+                        ],
+                        width=3,
+                    ),
+                ],
+                className="mb-4",
+            ),
+            html.Div(id="btw-quarter-detail"),
         ]
-        + cards
+    )
+
+
+@callback(
+    Output("btw-quarter-detail", "children"),
+    Input("btw-quarter-select", "value"),
+)
+def render_btw_quarter(selected_quarter):
+    if not selected_quarter:
+        return dbc.Alert("Selecteer een kwartaal.", color="info")
+
+    data = load_data()
+    txns = data.get("transactions", [])
+    df = pd.DataFrame(txns)
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["quarter"] = df["date"].dt.to_period("Q").astype(str)
+    df["btw_rate_val"] = df["btw_rate"].map(BTW_RATES).fillna(0)
+    df["amount_excl"] = df.apply(
+        lambda r: r["amount"] / (1 + r["btw_rate_val"]) if r["btw_rate_val"] > 0 else r["amount"],
+        axis=1,
+    ).round(2)
+    df["btw_amount"] = (df["amount"] - df["amount_excl"]).round(2)
+
+    dq = df[df["quarter"] == selected_quarter]
+    if dq.empty:
+        return dbc.Alert("Geen transacties in dit kwartaal.", color="info")
+
+    income = dq[dq["type"] == "income"]
+    expense = dq[dq["type"] == "expense"]
+
+    # --- Rubriek 1a: Leveringen/diensten belast met 21% ---
+    inc_21 = income[income["btw_rate"] == "21%"]
+    r1a_omzet = inc_21["amount_excl"].sum()
+    r1a_btw = inc_21["btw_amount"].sum()
+
+    # --- Rubriek 1b: Leveringen/diensten belast met 9% ---
+    inc_9 = income[income["btw_rate"] == "9%"]
+    r1b_omzet = inc_9["amount_excl"].sum()
+    r1b_btw = inc_9["btw_amount"].sum()
+
+    # --- Rubriek 1e: Leveringen/diensten belast met 0% of niet bij u belast ---
+    inc_0 = income[income["btw_rate"].isin(["0% (vrijgesteld)", "Geen BTW"])]
+    r1e_omzet = inc_0["amount_excl"].sum()
+
+    # --- Rubriek 5a: Totaal verschuldigde BTW ---
+    r5a = r1a_btw + r1b_btw
+
+    # --- Rubriek 5b: Voorbelasting (all input VAT on expenses, one number) ---
+    r5b = expense["btw_amount"].sum()
+
+    # --- Rubriek 5c: Subtotaal ---
+    r5c = r5a - r5b
+
+    # --- Rubriek 5f: Te betalen / terug te ontvangen ---
+    r5f = r5c  # No KOR or estimate corrections in this tool
+
+    # Build the form-like display
+    form_table = dbc.Table(
+        [
+            html.Thead(
+                html.Tr(
+                    [
+                        html.Th("Rubriek", style={"width": "100px"}),
+                        html.Th("Omschrijving"),
+                        html.Th("Omzet (€)", style={"width": "150px", "textAlign": "right"}),
+                        html.Th("BTW (€)", style={"width": "150px", "textAlign": "right"}),
+                    ]
+                ),
+                className="table-dark",
+            ),
+            html.Tbody(
+                [
+                    # Section 1 header
+                    html.Tr(
+                        html.Td(
+                            html.Strong("1. Prestaties binnenland"),
+                            colSpan=4,
+                        ),
+                        className="table-secondary",
+                    ),
+                    html.Tr(
+                        [
+                            html.Td("1a"),
+                            html.Td("Leveringen/diensten belast met 21%"),
+                            html.Td(f"{r1a_omzet:,.2f}", style={"textAlign": "right"}),
+                            html.Td(f"{r1a_btw:,.2f}", style={"textAlign": "right"}),
+                        ]
+                    ),
+                    html.Tr(
+                        [
+                            html.Td("1b"),
+                            html.Td("Leveringen/diensten belast met 9%"),
+                            html.Td(f"{r1b_omzet:,.2f}", style={"textAlign": "right"}),
+                            html.Td(f"{r1b_btw:,.2f}", style={"textAlign": "right"}),
+                        ]
+                    ),
+                    html.Tr(
+                        [
+                            html.Td("1e"),
+                            html.Td("Leveringen/diensten belast met 0% of niet bij u belast"),
+                            html.Td(f"{r1e_omzet:,.2f}", style={"textAlign": "right"}),
+                            html.Td("—", style={"textAlign": "right"}),
+                        ]
+                    ),
+                    # Section 5 header
+                    html.Tr(
+                        html.Td(
+                            html.Strong("5. Voorbelasting en totaal"),
+                            colSpan=4,
+                        ),
+                        className="table-secondary",
+                    ),
+                    html.Tr(
+                        [
+                            html.Td("5a"),
+                            html.Td("Totaal verschuldigde BTW (1a + 1b BTW)"),
+                            html.Td("", style={"textAlign": "right"}),
+                            html.Td(
+                                html.Strong(f"{r5a:,.2f}"),
+                                style={"textAlign": "right"},
+                            ),
+                        ],
+                        className="table-warning" if r5a > 0 else "",
+                    ),
+                    html.Tr(
+                        [
+                            html.Td("5b"),
+                            html.Td("Voorbelasting (BTW op je inkopen/kosten)"),
+                            html.Td("", style={"textAlign": "right"}),
+                            html.Td(
+                                html.Strong(f"{r5b:,.2f}"),
+                                style={"textAlign": "right", "color": "#27ae60"},
+                            ),
+                        ]
+                    ),
+                    html.Tr(
+                        [
+                            html.Td("5c"),
+                            html.Td("Subtotaal (5a min 5b)"),
+                            html.Td("", style={"textAlign": "right"}),
+                            html.Td(
+                                html.Strong(f"{r5c:,.2f}"),
+                                style={"textAlign": "right"},
+                            ),
+                        ]
+                    ),
+                    # Final row
+                    html.Tr(
+                        [
+                            html.Td(html.Strong("5f")),
+                            html.Td(
+                                html.Strong(
+                                    "Te betalen aan Belastingdienst"
+                                    if r5f >= 0
+                                    else "Terug te ontvangen van Belastingdienst"
+                                )
+                            ),
+                            html.Td("", style={"textAlign": "right"}),
+                            html.Td(
+                                html.Strong(f"€ {abs(r5f):,.2f}"),
+                                style={
+                                    "textAlign": "right",
+                                    "fontSize": "1.2em",
+                                    "color": "#c0392b" if r5f >= 0 else "#27ae60",
+                                },
+                            ),
+                        ],
+                        className="table-info",
+                    ),
+                ]
+            ),
+        ],
+        bordered=True,
+        hover=True,
+        responsive=True,
+        className="mb-4",
+    )
+
+    # Expense voorbelasting breakdown (helpful, not on the form itself)
+    exp_by_cat = (
+        expense.groupby("category")
+        .agg({"amount_excl": "sum", "btw_amount": "sum", "amount": "sum"})
+        .reset_index()
+    )
+
+    expense_detail = []
+    if len(exp_by_cat) > 0:
+        detail_rows = [
+            html.Tr(
+                [
+                    html.Td(row["category"]),
+                    html.Td(f"€ {row['amount']:,.2f}", style={"textAlign": "right"}),
+                    html.Td(f"€ {row['btw_amount']:,.2f}", style={"textAlign": "right"}),
+                ]
+            )
+            for _, row in exp_by_cat.iterrows()
+        ]
+        expense_detail = [
+            html.Details(
+                [
+                    html.Summary("Specificatie voorbelasting (5b) per categorie"),
+                    dbc.Table(
+                        [
+                            html.Thead(
+                                html.Tr(
+                                    [
+                                        html.Th("Categorie"),
+                                        html.Th("Bedrag incl.", style={"textAlign": "right"}),
+                                        html.Th("BTW (voorbelasting)", style={"textAlign": "right"}),
+                                    ]
+                                )
+                            ),
+                            html.Tbody(detail_rows),
+                        ],
+                        bordered=True,
+                        size="sm",
+                        className="mt-2",
+                    ),
+                ],
+                className="mb-4",
+            )
+        ]
+
+    # Filing guidance
+    guidance = dbc.Alert(
+        [
+            html.Strong("Invulinstructie: "),
+            "Ga naar MijnBelastingdienst → Omzetbelasting → Aangifte doen. "
+            "Vul de rubrieken 1a t/m 1e in met de bedragen hierboven. "
+            "Rubriek 5b (voorbelasting) vul je in als één totaalbedrag. "
+            "De rubrieken 2a, 3a-3c, 4a-4b zijn voor intracommunautaire/buitenlandse "
+            "transacties — vul deze alleen in als je zaken doet buiten Nederland.",
+        ],
+        color="light",
+        className="border",
+    )
+
+    return html.Div(
+        [form_table] + expense_detail + [guidance]
     )
 
 
