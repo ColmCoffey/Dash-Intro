@@ -55,10 +55,87 @@ CATEGORIES_EXPENSE = [
     "Marketing & reclame",
     "Afschrijvingen (depreciation)",
     "Autokosten (vehicle)",
+    "Oprichtingskosten (company setup)",
     "Overige kosten (other expenses)",
 ]
 
 BTW_RATES = {"21%": 0.21, "9%": 0.09, "0% (vrijgesteld)": 0.0, "Geen BTW": 0.0}
+
+# Default BTW rate per expense category — so you don't have to think about it.
+# Travel (OV) is 9% in NL. Insurance is exempt. Everything else is 21%.
+CATEGORY_BTW_DEFAULTS = {
+    "Kantoorkosten (office)": "21%",
+    "Reiskosten (travel)": "9%",
+    "Telefoon & internet": "21%",
+    "Software & abonnementen": "21%",
+    "Verzekeringen (insurance)": "0% (vrijgesteld)",
+    "Professionele diensten (legal/accounting)": "21%",
+    "Marketing & reclame": "21%",
+    "Afschrijvingen (depreciation)": "Geen BTW",
+    "Autokosten (vehicle)": "21%",
+    "Oprichtingskosten (company setup)": "21%",
+    "Overige kosten (other expenses)": "21%",
+    # Income
+    "Omzet diensten (services)": "21%",
+    "Omzet producten (products)": "21%",
+    "Overige inkomsten (other income)": "21%",
+}
+
+# Auto-categorization rules for CSV bank imports.
+# Maps keywords found in transaction descriptions to (category, btw_rate).
+# Checked in order — first match wins.
+AUTO_CATEGORIZE_RULES = [
+    # Travel — Dutch public transport (OV) is 9% BTW
+    (["ns.nl", "ns -", "nederlandse spoor", "ov-chipkaart", "ovchipkaart",
+      "translink", "gvb", "ret ", "htm ", "arriva", "connexxion", "qbuzz",
+      "9292", "flixbus", "thalys"],
+     "Reiskosten (travel)", "9%"),
+
+    # Software & subscriptions — 21%
+    (["github", "gitlab", "atlassian", "jira", "confluence", "slack",
+      "notion", "figma", "adobe", "microsoft", "google workspace",
+      "google cloud", "aws ", "amazon web services", "azure", "heroku",
+      "vercel", "netlify", "digitalocean", "hetzner", "openai",
+      "anthropic", "stripe", "hubspot", "mailchimp", "zoom", "miro",
+      "linear", "1password", "bitwarden", "dropbox", "icloud",
+      "spotify business", "canva"],
+     "Software & abonnementen", "21%"),
+
+    # Telecom — 21%
+    (["kpn", "vodafone", "t-mobile", "tele2", "ziggo", "odido",
+      "simyo", "ben nl", "lebara"],
+     "Telefoon & internet", "21%"),
+
+    # Insurance — exempt
+    (["verzekering", "insurance", "nationale nederlanden", "centraal beheer",
+      "interpolis", "aegon", "a.s.r.", "allianz", "achmea"],
+     "Verzekeringen (insurance)", "0% (vrijgesteld)"),
+
+    # Office supplies — 21%
+    (["bol.com", "coolblue", "mediamarkt", "ikea", "hema", "bruna",
+      "staples", "viking", "office depot", "action"],
+     "Kantoorkosten (office)", "21%"),
+
+    # Professional services — 21%
+    (["notaris", "advocaat", "kvk", "kamer van koophandel", "belastingdienst",
+      "accountant", "boekhouder"],
+     "Professionele diensten (legal/accounting)", "21%"),
+
+    # Company setup — 21%
+    (["kvk inschrijving", "oprichting", "akte"],
+     "Oprichtingskosten (company setup)", "21%"),
+]
+
+
+def auto_categorize(description: str) -> tuple[str, str]:
+    """Match a bank transaction description to a category and BTW rate.
+    Returns (category, btw_rate) or defaults if no match."""
+    desc_lower = description.lower().strip()
+    for keywords, category, btw in AUTO_CATEGORIZE_RULES:
+        for kw in keywords:
+            if kw in desc_lower:
+                return category, btw
+    return None, None
 
 
 def load_data() -> dict:
@@ -1292,6 +1369,18 @@ def update_categories(txn_type):
     return opts, CATEGORIES_EXPENSE[0]
 
 
+# --- Auto-set BTW rate when category changes ---
+@callback(
+    Output("txn-btw", "value"),
+    Input("txn-category", "value"),
+    prevent_initial_call=True,
+)
+def auto_set_btw(category):
+    if category and category in CATEGORY_BTW_DEFAULTS:
+        return CATEGORY_BTW_DEFAULTS[category]
+    return "21%"
+
+
 # --- Add transaction ---
 @callback(
     Output("txn-feedback", "children"),
@@ -1501,6 +1590,7 @@ def import_csv(contents, filename):
 
     data = load_data()
     count = 0
+    auto_matched = 0
     for _, row in df.iterrows():
         try:
             amount = float(str(row[col_map["amount"]]).replace(",", ".").replace(" ", ""))
@@ -1510,21 +1600,40 @@ def import_csv(contents, filename):
         txn_type = "income" if amount >= 0 else "expense"
         desc = str(row.get(col_map.get("description", ""), "")) if "description" in col_map else ""
 
+        # Auto-categorize based on description
+        matched_cat, matched_btw = auto_categorize(desc)
+        if matched_cat:
+            category = matched_cat
+            btw_rate = matched_btw
+            auto_matched += 1
+        else:
+            # Defaults: income → services 21%, expense → other 21%
+            category = CATEGORIES_INCOME[0] if txn_type == "income" else "Overige kosten (other expenses)"
+            btw_rate = CATEGORY_BTW_DEFAULTS.get(category, "21%")
+
         txn = {
             "id": str(uuid.uuid4())[:8],
             "date": str(row[col_map["date"]]),
             "type": txn_type,
             "amount": round(abs(amount), 2),
-            "btw_rate": "21%",
-            "category": CATEGORIES_INCOME[0] if txn_type == "income" else CATEGORIES_EXPENSE[0],
+            "btw_rate": btw_rate,
+            "category": category,
             "description": desc,
         }
         data["transactions"].append(txn)
         count += 1
 
+    add_audit_entry(data, "CSV_IMPORT", f"{count} transactions from {filename} ({auto_matched} auto-categorized)")
     save_data(data)
+
+    msg = f"{count} transacties geïmporteerd uit {filename}."
+    if auto_matched > 0:
+        msg += f" {auto_matched} automatisch gecategoriseerd."
+    if count - auto_matched > 0:
+        msg += f" {count - auto_matched} als 'overige kosten' — controleer deze op de Transacties pagina."
+
     return (
-        dbc.Alert(f"{count} transacties geïmporteerd uit {filename}!", color="success"),
+        dbc.Alert(msg, color="success"),
         "/import-export",
     )
 
