@@ -136,15 +136,128 @@ AUTO_CATEGORIZE_RULES = [
 ]
 
 
-def auto_categorize(description: str) -> tuple[str, str]:
-    """Match a bank transaction description to a category and BTW rate.
-    Returns (category, btw_rate) or defaults if no match."""
+def auto_categorize(description: str) -> tuple[str | None, str | None, str, str]:
+    """Categorize a transaction by rules first, LLM second.
+    Returns (category, btw_rate, explanation, source).
+    source is 'rule' or 'llm' or 'unmatched'."""
     desc_lower = description.lower().strip()
     for keywords, category, btw in AUTO_CATEGORIZE_RULES:
         for kw in keywords:
             if kw in desc_lower:
-                return category, btw
-    return None, None
+                explanation = f"Keyword '{kw}' matched → {category} at {btw}"
+                return category, btw, explanation, "rule"
+    return None, None, "", "unmatched"
+
+
+def llm_categorize_batch(transactions: list[dict]) -> list[dict]:
+    """Use Claude to categorize transactions that rules couldn't match.
+    Each transaction dict has 'description', 'amount', 'type'.
+    Returns list of dicts with 'category', 'btw_rate', 'explanation'."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        # No API key — return unmatched defaults with explanation
+        return [
+            {
+                "category": None,
+                "btw_rate": None,
+                "explanation": "No ANTHROPIC_API_KEY set — cannot use LLM. Set it in your environment to enable AI categorization.",
+            }
+            for _ in transactions
+        ]
+
+    import anthropic
+
+    all_categories = CATEGORIES_INCOME + CATEGORIES_EXPENSE
+    categories_str = "\n".join(f"- {c}" for c in all_categories)
+    btw_rates_str = ", ".join(BTW_RATES.keys())
+
+    # Build batch prompt
+    items_text = "\n".join(
+        f"{i+1}. [{t['type']}] €{t['amount']} — \"{t['description']}\""
+        for i, t in enumerate(transactions)
+    )
+
+    prompt = f"""You are a Dutch bookkeeping assistant. Categorize each bank transaction below.
+
+ALLOWED CATEGORIES:
+{categories_str}
+
+ALLOWED BTW RATES: {btw_rates_str}
+
+DUTCH BTW RULES:
+- Most goods/services: 21%
+- Food, drinks, books, medicines, public transport: 9%
+- Insurance, education, healthcare: 0% (vrijgesteld)
+- Depreciation entries: Geen BTW
+- Business meals/entertainment: 9% BTW (food rate), but only 80% deductible for income tax
+
+TRANSACTIONS TO CATEGORIZE:
+{items_text}
+
+For each transaction, respond with EXACTLY this JSON format (one per line, no markdown):
+{{"index": 1, "category": "exact category name", "btw_rate": "21%", "explanation": "short reason in English"}}
+
+Rules:
+- Use ONLY categories from the allowed list above (exact spelling)
+- Be specific in the explanation — mention what the merchant/description tells you
+- If genuinely uncertain, use "Overige kosten (other expenses)" and say why in the explanation
+- Personal expenses (own lunch, groceries, personal clothing) should be flagged in the explanation as "WARNING: likely personal, not deductible"
+"""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+
+        results = []
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(line)
+                # Validate category exists
+                cat = parsed.get("category", "")
+                if cat not in all_categories:
+                    cat = "Overige kosten (other expenses)"
+                    parsed["explanation"] += f" (LLM suggested '{parsed.get('category')}' which is not a valid category)"
+                btw = parsed.get("btw_rate", "21%")
+                if btw not in BTW_RATES:
+                    btw = "21%"
+                results.append({
+                    "category": cat,
+                    "btw_rate": btw,
+                    "explanation": parsed.get("explanation", "LLM categorized"),
+                })
+            except json.JSONDecodeError:
+                results.append({
+                    "category": None,
+                    "btw_rate": None,
+                    "explanation": f"Failed to parse LLM response: {line[:100]}",
+                })
+
+        # Pad if LLM returned fewer results than expected
+        while len(results) < len(transactions):
+            results.append({
+                "category": None,
+                "btw_rate": None,
+                "explanation": "LLM did not return a result for this item",
+            })
+        return results
+
+    except Exception as e:
+        return [
+            {
+                "category": None,
+                "btw_rate": None,
+                "explanation": f"LLM error: {e}",
+            }
+            for _ in transactions
+        ]
 
 
 def load_data() -> dict:
@@ -1169,14 +1282,15 @@ def import_export_page(data):
                                 [
                                     html.H5("CSV Importeren"),
                                     html.P(
-                                        "Upload een CSV-bestand van je bank (kolommen: date, amount, description). "
-                                        "Negatieve bedragen worden als uitgaven geïmporteerd.",
+                                        "Upload een CSV van je bank. Transacties worden automatisch "
+                                        "gecategoriseerd (regels + AI) en je kunt alles reviewen "
+                                        "voordat het wordt opgeslagen.",
                                         className="text-muted",
                                     ),
                                     dcc.Upload(
                                         id="csv-upload",
                                         children=dbc.Button(
-                                            "Kies CSV-bestand",
+                                            "Stap 1: Kies CSV-bestand",
                                             color="secondary",
                                             outline=True,
                                         ),
@@ -1184,11 +1298,20 @@ def import_export_page(data):
                                         accept=".csv",
                                     ),
                                     html.Div(id="import-feedback", className="mt-2"),
+                                    # Review table appears here after upload
+                                    html.Div(id="import-review-section"),
+                                    # Hidden store for staged transactions
+                                    dcc.Store(id="staged-transactions", storage_type="memory"),
                                 ]
                             )
                         ),
-                        width=6,
+                        width=12,
                     ),
+                ],
+                className="mb-4",
+            ),
+            dbc.Row(
+                [
                     dbc.Col(
                         dbc.Card(
                             dbc.CardBody(
@@ -1577,16 +1700,18 @@ def create_invoice(n_clicks, client, client_addr, desc, amount, btw, inv_date, t
 
 
 # --- CSV Import ---
+# --- CSV Import Step 1: Parse, categorize (rules + LLM), show review ---
 @callback(
     Output("import-feedback", "children"),
-    Output("url", "pathname", allow_duplicate=True),
+    Output("import-review-section", "children"),
+    Output("staged-transactions", "data"),
     Input("csv-upload", "contents"),
     State("csv-upload", "filename"),
     prevent_initial_call=True,
 )
-def import_csv(contents, filename):
+def import_csv_step1(contents, filename):
     if contents is None:
-        return "", dash.no_update
+        return "", None, None
 
     import base64
 
@@ -1596,7 +1721,7 @@ def import_csv(contents, filename):
     try:
         df = pd.read_csv(StringIO(decoded))
     except Exception as e:
-        return dbc.Alert(f"Fout bij lezen CSV: {e}", color="danger"), dash.no_update
+        return dbc.Alert(f"Fout bij lezen CSV: {e}", color="danger"), None, None
 
     # Try to find columns
     col_map = {}
@@ -1615,12 +1740,13 @@ def import_csv(contents, filename):
                 "CSV moet minimaal 'date'/'datum' en 'amount'/'bedrag' kolommen bevatten.",
                 color="danger",
             ),
-            dash.no_update,
+            None,
+            None,
         )
 
-    data = load_data()
-    count = 0
-    auto_matched = 0
+    # Parse rows and run rule-based categorization first
+    staged = []
+    llm_needed = []
     for _, row in df.iterrows():
         try:
             amount = float(str(row[col_map["amount"]]).replace(",", ".").replace(" ", ""))
@@ -1630,42 +1756,245 @@ def import_csv(contents, filename):
         txn_type = "income" if amount >= 0 else "expense"
         desc = str(row.get(col_map.get("description", ""), "")) if "description" in col_map else ""
 
-        # Auto-categorize based on description
-        matched_cat, matched_btw = auto_categorize(desc)
-        if matched_cat:
-            category = matched_cat
-            btw_rate = matched_btw
-            auto_matched += 1
-        else:
-            # Defaults: income → services 21%, expense → other 21%
-            category = CATEGORIES_INCOME[0] if txn_type == "income" else "Overige kosten (other expenses)"
-            btw_rate = CATEGORY_BTW_DEFAULTS.get(category, "21%")
+        matched_cat, matched_btw, explanation, source = auto_categorize(desc)
 
-        txn = {
+        entry = {
             "id": str(uuid.uuid4())[:8],
             "date": str(row[col_map["date"]]),
             "type": txn_type,
             "amount": round(abs(amount), 2),
+            "description": desc,
+            "category": matched_cat or "",
+            "btw_rate": matched_btw or "",
+            "explanation": explanation,
+            "source": source,
+        }
+        staged.append(entry)
+        if source == "unmatched":
+            llm_needed.append(entry)
+
+    # Run LLM on unmatched transactions (batched)
+    if llm_needed:
+        llm_results = llm_categorize_batch(llm_needed)
+        llm_idx = 0
+        for entry in staged:
+            if entry["source"] == "unmatched" and llm_idx < len(llm_results):
+                result = llm_results[llm_idx]
+                if result["category"]:
+                    entry["category"] = result["category"]
+                    entry["btw_rate"] = result.get("btw_rate", "21%")
+                    entry["explanation"] = result["explanation"]
+                    entry["source"] = "llm"
+                else:
+                    # LLM failed — use defaults
+                    default_cat = CATEGORIES_INCOME[0] if entry["type"] == "income" else "Overige kosten (other expenses)"
+                    entry["category"] = default_cat
+                    entry["btw_rate"] = CATEGORY_BTW_DEFAULTS.get(default_cat, "21%")
+                    entry["explanation"] = result.get("explanation", "Could not categorize") + " — using default"
+                    entry["source"] = "default"
+                llm_idx += 1
+
+    # Build review table
+    all_categories = CATEGORIES_INCOME + CATEGORIES_EXPENSE
+    review_rows = []
+    for i, entry in enumerate(staged):
+        # Color-code the source
+        if entry["source"] == "rule":
+            source_badge = dbc.Badge("Rule", color="success", className="me-1")
+        elif entry["source"] == "llm":
+            source_badge = dbc.Badge("AI", color="primary", className="me-1")
+        else:
+            source_badge = dbc.Badge("Default", color="warning", className="me-1")
+
+        # Warning highlight for potential issues
+        explanation_text = entry["explanation"]
+        has_warning = "WARNING" in explanation_text.upper()
+
+        review_rows.append(
+            html.Tr(
+                [
+                    html.Td(entry["date"], style={"whiteSpace": "nowrap"}),
+                    html.Td(
+                        f"€ {entry['amount']:,.2f}",
+                        style={"textAlign": "right", "color": "#27ae60" if entry["type"] == "income" else "#c0392b"},
+                    ),
+                    html.Td(
+                        entry["description"][:60] + ("..." if len(entry["description"]) > 60 else ""),
+                        style={"fontSize": "0.9em"},
+                    ),
+                    html.Td([source_badge]),
+                    html.Td(
+                        dbc.Select(
+                            id={"type": "review-cat", "index": i},
+                            options=[{"label": c, "value": c} for c in all_categories],
+                            value=entry["category"],
+                            size="sm",
+                        ),
+                        style={"minWidth": "200px"},
+                    ),
+                    html.Td(
+                        dbc.Select(
+                            id={"type": "review-btw", "index": i},
+                            options=[{"label": k, "value": k} for k in BTW_RATES],
+                            value=entry["btw_rate"],
+                            size="sm",
+                        ),
+                        style={"minWidth": "100px"},
+                    ),
+                    html.Td(
+                        explanation_text,
+                        style={
+                            "fontSize": "0.85em",
+                            "color": "#c0392b" if has_warning else "#7f8c8d",
+                            "fontWeight": "bold" if has_warning else "normal",
+                        },
+                    ),
+                ],
+                className="table-danger" if has_warning else "",
+            )
+        )
+
+    rule_count = sum(1 for e in staged if e["source"] == "rule")
+    llm_count = sum(1 for e in staged if e["source"] == "llm")
+    default_count = sum(1 for e in staged if e["source"] == "default")
+
+    summary_parts = [f"{len(staged)} transacties gevonden"]
+    if rule_count:
+        summary_parts.append(f"{rule_count} via regels")
+    if llm_count:
+        summary_parts.append(f"{llm_count} via AI")
+    if default_count:
+        summary_parts.append(f"{default_count} niet gecategoriseerd")
+
+    review_section = html.Div(
+        [
+            html.Hr(),
+            html.H5("Stap 2: Review & Bevestig"),
+            dbc.Alert(
+                " — ".join(summary_parts) + ". Pas categorieën en BTW-tarieven aan waar nodig.",
+                color="info",
+            ),
+            html.Div(
+                dbc.Table(
+                    [
+                        html.Thead(
+                            html.Tr(
+                                [
+                                    html.Th("Datum"),
+                                    html.Th("Bedrag"),
+                                    html.Th("Omschrijving"),
+                                    html.Th("Bron"),
+                                    html.Th("Categorie"),
+                                    html.Th("BTW"),
+                                    html.Th("Uitleg"),
+                                ]
+                            ),
+                            className="table-dark",
+                        ),
+                        html.Tbody(review_rows),
+                    ],
+                    bordered=True,
+                    hover=True,
+                    responsive=True,
+                    size="sm",
+                ),
+                style={"maxHeight": "500px", "overflowY": "auto"},
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(
+                        dbc.Button(
+                            f"Bevestig & importeer {len(staged)} transacties",
+                            id="import-confirm-btn",
+                            color="primary",
+                            size="lg",
+                            className="mt-3",
+                        ),
+                        width="auto",
+                    ),
+                    dbc.Col(
+                        dbc.Button(
+                            "Annuleren",
+                            id="import-cancel-btn",
+                            color="secondary",
+                            outline=True,
+                            size="lg",
+                            className="mt-3",
+                        ),
+                        width="auto",
+                    ),
+                ]
+            ),
+            html.Div(id="import-confirm-feedback", className="mt-2"),
+        ],
+        className="mt-3",
+    )
+
+    return (
+        dbc.Alert(f"CSV geladen: {filename}", color="success", duration=3000),
+        review_section,
+        staged,
+    )
+
+
+# --- CSV Import Step 2: Confirm and save reviewed transactions ---
+@callback(
+    Output("import-confirm-feedback", "children"),
+    Output("url", "pathname", allow_duplicate=True),
+    Input("import-confirm-btn", "n_clicks"),
+    State("staged-transactions", "data"),
+    State({"type": "review-cat", "index": dash.ALL}, "value"),
+    State({"type": "review-btw", "index": dash.ALL}, "value"),
+    prevent_initial_call=True,
+)
+def import_csv_step2(n_clicks, staged, review_cats, review_btws):
+    if not n_clicks or not staged:
+        return "", dash.no_update
+
+    data = load_data()
+    count = 0
+    for i, entry in enumerate(staged):
+        # Use reviewed values (user may have changed them)
+        category = review_cats[i] if i < len(review_cats) else entry["category"]
+        btw_rate = review_btws[i] if i < len(review_btws) else entry["btw_rate"]
+
+        txn = {
+            "id": entry["id"],
+            "date": entry["date"],
+            "type": entry["type"],
+            "amount": entry["amount"],
             "btw_rate": btw_rate,
             "category": category,
-            "description": desc,
+            "description": entry["description"],
         }
         data["transactions"].append(txn)
         count += 1
 
-    add_audit_entry(data, "CSV_IMPORT", f"{count} transactions from {filename} ({auto_matched} auto-categorized)")
+    sources = {}
+    for entry in staged:
+        sources[entry["source"]] = sources.get(entry["source"], 0) + 1
+    source_str = ", ".join(f"{v} {k}" for k, v in sources.items())
+
+    add_audit_entry(data, "CSV_IMPORT", f"{count} transactions imported (categorized: {source_str})")
     save_data(data)
 
-    msg = f"{count} transacties geïmporteerd uit {filename}."
-    if auto_matched > 0:
-        msg += f" {auto_matched} automatisch gecategoriseerd."
-    if count - auto_matched > 0:
-        msg += f" {count - auto_matched} als 'overige kosten' — controleer deze op de Transacties pagina."
-
     return (
-        dbc.Alert(msg, color="success"),
+        dbc.Alert(f"{count} transacties opgeslagen!", color="success", duration=3000),
         "/import-export",
     )
+
+
+# --- Cancel import ---
+@callback(
+    Output("import-review-section", "children", allow_duplicate=True),
+    Output("staged-transactions", "data", allow_duplicate=True),
+    Input("import-cancel-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def cancel_import(n_clicks):
+    if not n_clicks:
+        return dash.no_update, dash.no_update
+    return None, None
 
 
 # --- Export ---
