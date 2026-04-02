@@ -26,6 +26,7 @@ DATA_FILE = DATA_DIR / "bookkeeping.json"
 EMPTY_DATA = {
     "transactions": [],
     "invoices": [],
+    "audit_log": [],
     "company": {
         "name": "",
         "kvk": "",
@@ -34,6 +35,9 @@ EMPTY_DATA = {
         "bank_iban": "",
     },
 }
+
+# Dutch fiscal administration retention: 7 years (Belastingdienst)
+FISCAL_RETENTION_YEARS = 7
 
 CATEGORIES_INCOME = [
     "Omzet diensten (services)",
@@ -60,14 +64,61 @@ BTW_RATES = {"21%": 0.21, "9%": 0.09, "0% (vrijgesteld)": 0.0, "Geen BTW": 0.0}
 def load_data() -> dict:
     if DATA_FILE.exists():
         with open(DATA_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Ensure audit_log exists for older data files
+        data.setdefault("audit_log", [])
+        return data
     return json.loads(json.dumps(EMPTY_DATA))
 
 
 def save_data(data: dict):
     DATA_DIR.mkdir(exist_ok=True)
+    # Create timestamped backup before overwriting (Dutch law: 7-year retention)
+    if DATA_FILE.exists():
+        backup_dir = DATA_DIR / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = backup_dir / f"bookkeeping_{ts}.json"
+        # Only keep daily backups to avoid disk bloat
+        existing = sorted(backup_dir.glob("bookkeeping_*.json"))
+        today_prefix = f"bookkeeping_{datetime.now().strftime('%Y%m%d')}"
+        today_backups = [f for f in existing if f.name.startswith(today_prefix)]
+        if not today_backups:
+            import shutil
+            shutil.copy2(DATA_FILE, backup_file)
+        # Clean backups older than retention period
+        cutoff = datetime.now().timestamp() - (FISCAL_RETENTION_YEARS * 365.25 * 86400)
+        for old in existing:
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2, default=str)
+
+
+def add_audit_entry(data: dict, action: str, details: str):
+    """Append an immutable audit log entry — required for Dutch fiscal compliance."""
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "action": action,
+        "details": details,
+    }
+    data.setdefault("audit_log", []).append(entry)
+
+
+def validate_btw_id(btw_id: str) -> bool:
+    """Basic validation of Dutch BTW identification number format: NL + 9 digits + B + 2 digits."""
+    import re
+    if not btw_id:
+        return True  # optional field
+    return bool(re.match(r"^NL\d{9}B\d{2}$", btw_id.strip()))
+
+
+def validate_iban(iban: str) -> bool:
+    """Basic validation of Dutch IBAN format."""
+    import re
+    if not iban:
+        return True
+    return bool(re.match(r"^NL\d{2}[A-Z]{4}\d{10}$", iban.strip().replace(" ", "")))
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +142,7 @@ SIDEBAR = dbc.Nav(
         dbc.NavLink("BTW Aangifte", href="/btw", active="exact"),
         dbc.NavLink("Facturen", href="/invoices", active="exact"),
         dbc.NavLink("Import / Export", href="/import-export", active="exact"),
+        dbc.NavLink("Audit Log", href="/audit", active="exact"),
         dbc.NavLink("Instellingen", href="/settings", active="exact"),
     ],
     vertical=True,
@@ -274,7 +326,101 @@ def dashboard_page(data):
                     dbc.Col(dcc.Graph(figure=fig_cat), width=5),
                 ]
             ),
+            html.Hr(),
+            _compliance_warnings(data, df_year, current_year),
         ]
+    )
+
+
+def _compliance_warnings(data, df_year, current_year):
+    """Generate Dutch compliance warnings and reminders."""
+    warnings = []
+    company = data.get("company", {})
+
+    # Check company details are filled in (required on invoices per Dutch law)
+    missing = []
+    if not company.get("name"):
+        missing.append("Bedrijfsnaam")
+    if not company.get("kvk"):
+        missing.append("KVK nummer")
+    if not company.get("btw_id"):
+        missing.append("BTW-identificatienummer")
+    if not company.get("bank_iban"):
+        missing.append("IBAN")
+    if missing:
+        warnings.append(
+            dbc.Alert(
+                [
+                    html.Strong("Bedrijfsgegevens incompleet: "),
+                    f"Vul de volgende velden in bij Instellingen: {', '.join(missing)}. "
+                    "Deze gegevens zijn wettelijk verplicht op facturen (KVK-wet).",
+                ],
+                color="warning",
+            )
+        )
+
+    # BTW filing deadline reminders
+    now = datetime.now()
+    q = (now.month - 1) // 3  # previous quarter (0-indexed)
+    deadline_months = {0: (1, "Q4 vorig jaar"), 1: (4, "Q1"), 2: (7, "Q2"), 3: (10, "Q3")}
+    if q in deadline_months:
+        dl_month, q_label = deadline_months[q]
+        # Dutch BTW deadline: last day of month following quarter end
+        import calendar
+        dl_year = now.year if q > 0 else now.year
+        dl_day = calendar.monthrange(dl_year, dl_month)[1]
+        deadline = date(dl_year, dl_month, dl_day)
+        if now.date() <= deadline:
+            days_left = (deadline - now.date()).days
+            if days_left <= 14:
+                warnings.append(
+                    dbc.Alert(
+                        [
+                            html.Strong(f"BTW aangifte deadline: "),
+                            f"{q_label} {current_year} — nog {days_left} dagen "
+                            f"(deadline: {deadline.strftime('%d-%m-%Y')}). "
+                            "Ga naar BTW Aangifte voor je overzicht.",
+                        ],
+                        color="danger",
+                    )
+                )
+
+    # Check for transactions without descriptions (audit risk)
+    no_desc = len(df_year[df_year.get("description", pd.Series(dtype=str)).eq("") | df_year.get("description", pd.Series(dtype=str)).isna()]) if "description" in df_year.columns else 0
+    if no_desc > 0:
+        warnings.append(
+            dbc.Alert(
+                [
+                    html.Strong(f"{no_desc} transactie(s) zonder omschrijving. "),
+                    "De Belastingdienst vereist dat elke boeking een duidelijke omschrijving heeft. "
+                    "Voeg omschrijvingen toe om problemen bij controle te voorkomen.",
+                ],
+                color="info",
+            )
+        )
+
+    # KOR (Kleineondernemersregeling) threshold check
+    total_income = df_year.loc[df_year["type"] == "income", "amount"].sum() if len(df_year) > 0 else 0
+    if total_income > 0 and total_income <= 20000:
+        warnings.append(
+            dbc.Alert(
+                [
+                    html.Strong("KOR drempel: "),
+                    f"Je omzet (€{total_income:,.2f}) valt onder de €20.000 KOR-grens. "
+                    "Overweeg de Kleineondernemersregeling (KOR) bij de Belastingdienst — "
+                    "je hoeft dan geen BTW af te dragen.",
+                ],
+                color="info",
+            )
+        )
+
+    if not warnings:
+        warnings.append(
+            dbc.Alert("Geen waarschuwingen — alles ziet er goed uit!", color="success")
+        )
+
+    return html.Div(
+        [html.H5("Compliance & Waarschuwingen")] + warnings
     )
 
 
@@ -797,6 +943,58 @@ def import_export_page(data):
 
 
 # ========================================================================
+# PAGE: Audit Log
+# ========================================================================
+
+def audit_page(data):
+    log = data.get("audit_log", [])
+    if not log:
+        return html.Div(
+            [
+                html.H3("Audit Log"),
+                html.P(
+                    "Alle wijzigingen worden automatisch gelogd voor compliance met de "
+                    "Nederlandse bewaarplicht (7 jaar). Dit logboek kan niet worden gewijzigd.",
+                    className="text-muted",
+                ),
+                dbc.Alert("Nog geen audit entries.", color="info"),
+            ]
+        )
+
+    df = pd.DataFrame(log)
+    df = df.sort_values("timestamp", ascending=False)
+
+    table = dash_table.DataTable(
+        columns=[
+            {"name": "Tijdstip", "id": "timestamp"},
+            {"name": "Actie", "id": "action"},
+            {"name": "Details", "id": "details"},
+        ],
+        data=df.to_dict("records"),
+        page_size=50,
+        style_table={"overflowX": "auto"},
+        style_cell={"textAlign": "left", "padding": "8px"},
+        style_header={"fontWeight": "bold", "backgroundColor": "#ecf0f1"},
+        filter_action="native",
+        sort_action="native",
+    )
+
+    return html.Div(
+        [
+            html.H3("Audit Log"),
+            html.P(
+                "Onwijzigbaar logboek van alle boekingshandelingen — vereist voor "
+                "de Nederlandse fiscale bewaarplicht (7 jaar). Automatische dagelijkse backups "
+                "worden bewaard in data/backups/.",
+                className="text-muted",
+            ),
+            html.Hr(),
+            table,
+        ]
+    )
+
+
+# ========================================================================
 # PAGE: Settings
 # ========================================================================
 
@@ -900,6 +1098,8 @@ def display_page(pathname):
         return invoices_page(data)
     elif pathname == "/import-export":
         return import_export_page(data)
+    elif pathname == "/audit":
+        return audit_page(data)
     elif pathname == "/settings":
         return settings_page(data)
     return dashboard_page(data)
@@ -949,6 +1149,7 @@ def add_transaction(n_clicks, txn_date, txn_type, amount, btw, category, desc):
         "description": desc or "",
     }
     data["transactions"].append(txn)
+    add_audit_entry(data, "ADD_TRANSACTION", f"{txn['id']}: {txn_type} €{amount} ({btw}) — {desc or 'no description'}")
     save_data(data)
     return dbc.Alert("Transactie toegevoegd!", color="success", duration=2000), "/transactions"
 
@@ -968,6 +1169,10 @@ def delete_transactions(n_clicks, selected_rows, table_data):
 
     ids_to_delete = {table_data[i]["id"] for i in selected_rows}
     data = load_data()
+    # Log deleted transactions before removing (audit trail for Belastingdienst)
+    deleted_txns = [t for t in data["transactions"] if t.get("id") in ids_to_delete]
+    for dt in deleted_txns:
+        add_audit_entry(data, "DELETE_TRANSACTION", f"{dt['id']}: {dt['type']} €{dt['amount']} on {dt['date']} — {dt.get('description', '')}")
     data["transactions"] = [
         t for t in data["transactions"] if t.get("id") not in ids_to_delete
     ]
@@ -992,6 +1197,17 @@ def delete_transactions(n_clicks, selected_rows, table_data):
 def save_settings(n_clicks, name, kvk, btw_id, address, iban):
     if not n_clicks:
         return ""
+    # Validate formats
+    if btw_id and not validate_btw_id(btw_id):
+        return dbc.Alert(
+            "Ongeldig BTW-ID formaat. Verwacht: NL000000000B01",
+            color="danger",
+        )
+    if iban and not validate_iban(iban):
+        return dbc.Alert(
+            "Ongeldig IBAN formaat. Verwacht: NL00BANK0000000000",
+            color="danger",
+        )
     data = load_data()
     data["company"] = {
         "name": name or "",
@@ -1000,6 +1216,7 @@ def save_settings(n_clicks, name, kvk, btw_id, address, iban):
         "address": address or "",
         "bank_iban": iban or "",
     }
+    add_audit_entry(data, "UPDATE_SETTINGS", f"Company: {name}")
     save_data(data)
     return dbc.Alert("Instellingen opgeslagen!", color="success", duration=2000)
 
@@ -1058,6 +1275,7 @@ def create_invoice(n_clicks, client, client_addr, desc, amount, btw, inv_date, t
         "description": f"Factuur {inv_number} — {client}",
     }
     data["transactions"].append(txn)
+    add_audit_entry(data, "CREATE_INVOICE", f"{inv_number}: {client} — €{amount_excl} excl. BTW ({btw})")
     save_data(data)
 
     return (
